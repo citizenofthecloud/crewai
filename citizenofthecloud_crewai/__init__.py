@@ -36,6 +36,7 @@ from citizenofthecloud_crewai.tools import (
     VerifyAgentTool,
     LookupAgentTool,
     CheckTrustTool,
+    RegisterAgentTool,
     cloud_identity_tools,
 )
 from citizenofthecloud_crewai.crew import CloudIdentityCrew
@@ -49,6 +50,7 @@ __all__ = [
     "VerifyAgentTool",
     "LookupAgentTool",
     "CheckTrustTool",
+    "RegisterAgentTool",
     "cloud_identity_tools",
     "CloudIdentityCrew",
     "identity_step_callback",

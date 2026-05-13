@@ -231,3 +231,67 @@ def cloud_identity_tools(
         LookupAgentTool(registry_url=registry_url),
         CheckTrustTool(registry_url=registry_url),
     ]
+
+
+# ═══════════════════════════════════════════════════════════
+# REGISTER AGENT TOOL
+# ═══════════════════════════════════════════════════════════
+
+class RegisterAgentInput(BaseModel):
+    """Input for registering a new Cloud Identity agent."""
+    sdk_token: str = Field(description="A cotc_sdk_* token from citizenofthecloud.com/account")
+    name: str = Field(description="Human-readable name for the agent")
+    declared_purpose: str = Field(description="What the agent does (<= 500 chars)")
+    autonomy_level: str = Field(default="tool", description="'tool' | 'assistant' | 'agent' | 'self-directing'")
+    capabilities: Optional[list] = Field(default=None, description="Optional list of capability strings")
+    operational_domain: Optional[str] = Field(default=None, description="Optional domain string")
+
+
+class RegisterAgentTool(BaseTool):
+    """
+    Register a new Cloud Identity agent.
+
+    Generates a fresh Ed25519 keypair locally and posts the public key plus
+    metadata to the registry under the supplied SDK token. Returns cloud_id
+    + both keys. Private key never leaves this process — store it securely.
+    Use ONCE at agent setup; CloudIdentity uses the returned keys thereafter.
+    """
+
+    name: str = "register_cloud_agent"
+    description: str = (
+        "Register a new agent with the Citizen of the Cloud registry. Generates "
+        "a keypair locally and posts the public key under your SDK token. Returns "
+        "cloud_id, public_key, private_key. Use ONCE at agent setup time."
+    )
+    args_schema: Type[BaseModel] = RegisterAgentInput
+    registry_url: str = "https://citizenofthecloud.com"
+
+    def _run(
+        self,
+        sdk_token: str,
+        name: str,
+        declared_purpose: str,
+        autonomy_level: str = "tool",
+        capabilities: Optional[list] = None,
+        operational_domain: Optional[str] = None,
+    ) -> str:
+        from citizenofthecloud import register_agent, RegistryError, CloudSDKError
+        try:
+            result = register_agent(
+                sdk_token=sdk_token,
+                name=name,
+                declared_purpose=declared_purpose,
+                autonomy_level=autonomy_level,
+                capabilities=capabilities,
+                operational_domain=operational_domain,
+                registry_url=self.registry_url,
+            )
+        except (RegistryError, CloudSDKError) as e:
+            return f"Registration error: {e}"
+
+        return (
+            f"Registered: {result['cloud_id']}\n"
+            f"name: {result['name']}\n"
+            f"public_key:\n{result['public_key']}\n"
+            f"private_key (STORE SECURELY):\n{result['private_key']}"
+        )
