@@ -4,18 +4,54 @@ CrewAI integration for the [Citizen of the Cloud](https://citizenofthecloud.com)
 
 ## Install
 
+This package is currently distributed directly from GitHub. The PyPI release is not yet caught up with the latest features (most recently: `RegisterAgentTool` and SDK-token auth). For now, install from GitHub:
+
 ```bash
-# Clone (early access — not yet on PyPI)
 git clone https://github.com/citizenofthecloud/crewai.git
 pip install -e ./crewai
-
-# Once published:
-# pip install citizenofthecloud-crewai
 ```
 
-Requires the [Citizen of the Cloud Python SDK](https://github.com/citizenofthecloud/sdk-python).
+Or as a git dependency in `requirements.txt`:
+
+```
+citizenofthecloud-crewai @ git+https://github.com/citizenofthecloud/crewai.git@main
+```
+
+`pip` will also pull the [Citizen of the Cloud Python SDK](https://github.com/citizenofthecloud/sdk-python) — install that one from GitHub the same way for now (the published PyPI version is also behind).
 
 ## Quick Start
+
+### 0. Register a New Agent (One-Time Setup)
+
+If you don't already have an agent, `RegisterAgentTool` (or the underlying `register_agent()` function) creates one in a single call. Generates a fresh keypair locally, registers the public key under your SDK token, and returns the `cloud_id` + private key. Get a token from [citizenofthecloud.com/account](https://citizenofthecloud.com/account).
+
+```python
+from citizenofthecloud_crewai import RegisterAgentTool
+
+tool = RegisterAgentTool()
+result = tool._run(
+    sdk_token="cotc_sdk_…",          # from /account
+    name="My Research Bot",
+    declared_purpose="Summarize papers and surface trends",
+    autonomy_level="tool",
+)
+# result is a string containing the cloud_id + public_key + private_key.
+# Store the private_key securely — the server keeps only the public key.
+```
+
+Or call the underlying SDK function directly if you don't need the CrewAI `BaseTool` wrapper:
+
+```python
+from citizenofthecloud import register_agent
+
+agent = register_agent(
+    sdk_token="cotc_sdk_…",
+    name="My Research Bot",
+    declared_purpose="Summarize papers and surface trends",
+    autonomy_level="tool",
+)
+print(agent["cloud_id"], agent["private_key"])
+```
 
 ### 1. Add Identity Tools to Your Agents
 
@@ -186,6 +222,12 @@ response = requests.post(
 
 ## Tools Reference
 
+### RegisterAgentTool
+
+One-shot agent registration. Generates a fresh Ed25519 keypair locally, posts the public key to `/api/register` under your SDK token, and returns the `cloud_id` together with both keys. The private key never leaves the caller's process. Use ONCE at agent setup time, not in regular operation.
+
+**When to use:** Bootstrap a new agent from code instead of clicking through the website. Requires a `cotc_sdk_*` token from [/account](https://citizenofthecloud.com/account).
+
 ### VerifyAgentTool
 
 Full cryptographic verification of an agent's identity from request headers. Checks Ed25519 signature, timestamp freshness, registry status, and trust score.
@@ -214,6 +256,7 @@ Convenience function that returns all three tools in a list. Pass directly to an
 |---|---|
 | `CLOUD_ID` | Your crew's Cloud ID (e.g., `cc-7f3a9b2e-...`) |
 | `CLOUD_PRIVATE_KEY` | Your crew's Ed25519 private key (PEM format) |
+| `COTC_SDK_TOKEN` | Bootstrap SDK token (`cotc_sdk_*`) used by `RegisterAgentTool`. Obtain from [citizenofthecloud.com/account](https://citizenofthecloud.com/account). |
 
 ## Links
 
