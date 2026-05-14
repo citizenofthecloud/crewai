@@ -1,268 +1,296 @@
 # citizenofthecloud-crewai
 
-CrewAI integration for the [Citizen of the Cloud](https://citizenofthecloud.com) identity protocol. Add cryptographic identity and trust verification to your CrewAI crews.
+CrewAI integration for the [Citizen of the Cloud](https://citizenofthecloud.com) identity protocol.
+
+**20 items** — 17 agent-callable `BaseTool` subclasses + 3 structural primitives (FastAPI route guard, `CloudIdentityCrew` framework-native gate, step/task observability callbacks). Latest version: **`0.2.0`**.
+
+---
 
 ## Install
 
-This package is currently distributed directly from GitHub. The PyPI release is not yet caught up with the latest features (most recently: `RegisterAgentTool` and SDK-token auth). For now, install from GitHub:
-
 ```bash
+# From GitHub (recommended while PyPI catches up)
+pip install git+https://github.com/citizenofthecloud/crewai.git
+
+# Editable dev install
 git clone https://github.com/citizenofthecloud/crewai.git
 pip install -e ./crewai
 ```
 
-Or as a git dependency in `requirements.txt`:
+Pulls [`citizenofthecloud`](https://github.com/citizenofthecloud/sdk-python) and `crewai>=0.50.0` as deps. Requires Python ≥ 3.9 (≤ 3.13 — `crewai` does not yet support 3.14).
 
+> **CrewAI is Python-only**, so no cross-language wrappers needed.
+
+---
+
+## The 20-item surface
+
+### 17 agent-callable `BaseTool` subclasses
+
+| # | Tool class | Purpose |
+|---|---|---|
+| 1 | `LookupAgentTool` | Read another agent's public passport |
+| 2 | `GetServerIdentityTool` | Fetch this agent's own passport |
+| 3 | `ListDirectoryTool` | Browse the public agent directory |
+| 4 | `GovernanceFeedTool` | Read recent governance events |
+| 5 | `VerifyAgentTool` | Verify signed headers (simple) |
+| 6 | `VerifyRequestTool` | Verify request-bound signature |
+| 7 | `RequestChallengeTool` | Ask the registry for a nonce |
+| 8 | `RespondToChallengeTool` | Submit a signed nonce |
+| 9 | `SignChallengeTool` | Sign a nonce locally |
+| 10 | `ProveIdentityTool` | Full challenge/sign/respond loop |
+| 11 | `SignHeadersTool` | Produce timestamp-bound headers |
+| 12 | `SignRequestTool` | Produce request-bound headers |
+| 13 | `CloudFetchTool` | Auto-signed HTTP request |
+| 14 | `GenerateKeypairTool` | Make a fresh Ed25519 keypair |
+| 15 | `RegisterAgentTool` | Programmatic agent registration (SDK token) |
+| 16 | `ReportAgentTool` | File a governance report (SDK token w/ `manage`) |
+| 17 | `CheckTrustTool` | Trust threshold PASS/FAIL helper |
+
+### 3 structural primitives
+
+| # | Item | Purpose |
+|---|---|---|
+| 18 | `CloudIdentityRouteGuard` / `cloud_guard_route` | FastAPI BaseHTTPMiddleware + decorator (companion to in-process `cloud_guard`) |
+| 19 | `CloudIdentityCrew` | `Crew` subclass with built-in identity (framework-native gate) |
+| 20 | `identity_step_callback` / `identity_task_callback` | Structured-log callbacks for crew step & task events |
+
+Grab all 17 agent-callable tools at once with `cloud_identity_tools()`.
+
+---
+
+## Quick start (crew with built-in identity)
+
+```python
+from crewai import Agent, Task
+from citizenofthecloud_crewai import CloudIdentityCrew
+
+researcher = Agent(
+    role="Researcher",
+    goal="Verify other agents before sharing data.",
+    backstory="Skeptical by default.",
+)
+analyst = Agent(
+    role="Analyst",
+    goal="Analyze results and report.",
+    backstory="Skeptical by default.",
+)
+
+research_task = Task(
+    description="Verify cc-abc... and only proceed if trust >= 0.7.",
+    agent=researcher,
+)
+analysis_task = Task(
+    description="Summarize the verified agent's stated purpose and capabilities.",
+    agent=analyst,
+)
+
+crew = CloudIdentityCrew(
+    cloud_id="cc-self...",
+    private_key="-----BEGIN PRIVATE KEY-----\n...",
+    agents=[researcher, analyst],
+    tasks=[research_task, analysis_task],
+    minimum_trust_score=0.7,
+    # All 17 identity tools auto-injected into every agent in the crew
+)
+result = crew.kickoff()
 ```
-citizenofthecloud-crewai @ git+https://github.com/citizenofthecloud/crewai.git@main
+
+Or, if you only need the tools (not the full crew wiring):
+
+```python
+from crewai import Agent
+from citizenofthecloud_crewai import cloud_identity_tools
+
+agent = Agent(
+    role="Verifier",
+    goal="Verify and onboard new agents.",
+    tools=cloud_identity_tools(),   # all 17
+)
 ```
 
-`pip` will also pull the [Citizen of the Cloud Python SDK](https://github.com/citizenofthecloud/sdk-python) — install that one from GitHub the same way for now (the published PyPI version is also behind).
+---
 
-## Quick Start
+## Examples per surface
 
-### 0. Register a New Agent (One-Time Setup)
-
-If you don't already have an agent, `RegisterAgentTool` (or the underlying `register_agent()` function) creates one in a single call. Generates a fresh keypair locally, registers the public key under your SDK token, and returns the `cloud_id` + private key. Get a token from [citizenofthecloud.com/account](https://citizenofthecloud.com/account).
+### Registration (#15 RegisterAgentTool)
 
 ```python
 from citizenofthecloud_crewai import RegisterAgentTool
 
-tool = RegisterAgentTool()
-result = tool._run(
-    sdk_token="cotc_sdk_…",          # from /account
-    name="My Research Bot",
-    declared_purpose="Summarize papers and surface trends",
-    autonomy_level="tool",
-)
-# result is a string containing the cloud_id + public_key + private_key.
-# Store the private_key securely — the server keeps only the public key.
+RegisterAgentTool().invoke({
+    "sdk_token": "cotc_sdk_…",
+    "name": "Crew Research Bot",
+    "declared_purpose": "Summarize papers and surface trends",
+    "autonomy_level": "tool",
+})
 ```
 
-Or call the underlying SDK function directly if you don't need the CrewAI `BaseTool` wrapper:
+### Verification (#5 VerifyAgentTool, #17 CheckTrustTool)
 
 ```python
-from citizenofthecloud import register_agent
+from citizenofthecloud_crewai import VerifyAgentTool, CheckTrustTool
 
-agent = register_agent(
-    sdk_token="cotc_sdk_…",
-    name="My Research Bot",
-    declared_purpose="Summarize papers and surface trends",
-    autonomy_level="tool",
-)
-print(agent["cloud_id"], agent["private_key"])
+VerifyAgentTool().invoke({
+    "cloud_id": "cc-abc...",
+    "timestamp": "2026-05-13T12:00:00Z",
+    "signature": "iJk3...",
+})
+
+CheckTrustTool().invoke({"cloud_id": "cc-abc...", "minimum_trust_score": 0.7})
 ```
 
-### 1. Add Identity Tools to Your Agents
+### Signing & cloud-fetch (#11, #12, #13)
 
 ```python
-from crewai import Agent, Task, Crew
-from citizenofthecloud_crewai import cloud_identity_tools
+from citizenofthecloud_crewai import SignHeadersTool, SignRequestTool, CloudFetchTool
 
-# One line — all three identity tools added
-researcher = Agent(
-    role="Senior Research Analyst",
-    goal="Gather and verify information from trusted sources",
-    backstory="You are a meticulous researcher who always verifies "
-              "the identity of agents before accepting their data.",
-    tools=cloud_identity_tools(),
-    verbose=True,
-)
-
-analyst = Agent(
-    role="Data Analyst",
-    goal="Analyze data only from verified, trusted agents",
-    backstory="You never process data from unverified sources. "
-              "Always check trust scores before accepting input.",
-    tools=cloud_identity_tools(),
-    verbose=True,
-)
+SignHeadersTool().invoke({"cloud_id": "cc-...", "private_key": "..."})
+SignRequestTool().invoke({
+    "cloud_id": "cc-...", "private_key": "...",
+    "url": "https://other.com/api", "method": "POST", "body": '{"x":1}',
+})
+CloudFetchTool().invoke({
+    "cloud_id": "cc-...", "private_key": "...",
+    "url": "https://other.com/api", "method": "POST", "body": '{"x":1}',
+})
 ```
 
-### 2. Use CloudIdentityCrew for Automatic Integration
+### Challenge / Respond (#7, #8, #9, #10)
 
 ```python
-from citizenofthecloud_crewai import CloudIdentityCrew
-
-# Identity tools are injected into all agents automatically
-crew = CloudIdentityCrew(
-    cloud_id="cc-7f3a9b2e-...",
-    private_key="-----BEGIN PRIVATE KEY-----\n...",
-    agents=[researcher, analyst],
-    tasks=[research_task, analysis_task],
-    minimum_trust_score=0.5,
-    verbose=True,
+from citizenofthecloud_crewai import (
+    RequestChallengeTool, SignChallengeTool,
+    RespondToChallengeTool, ProveIdentityTool,
 )
 
-result = crew.kickoff()
+# 10 — full loop (recommended)
+ProveIdentityTool().invoke({"cloud_id": "cc-...", "private_key": "..."})
 
-# Or from environment variables (CLOUD_ID, CLOUD_PRIVATE_KEY):
-crew = CloudIdentityCrew.from_env(
-    agents=[researcher, analyst],
-    tasks=[research_task, analysis_task],
-)
+# Or manually: 7 → 9 → 8
+ch  = RequestChallengeTool().invoke({"cloud_id": "cc-..."})
+sig = SignChallengeTool().invoke({"nonce": "...", "private_key": "..."})
+RespondToChallengeTool().invoke({"cloud_id": "cc-...", "nonce": "...", "signature": sig})
 ```
 
-### 3. Gate Crew Execution with cloud_guard
+### Registry queries (#1, #2, #3, #4)
 
 ```python
-from fastapi import FastAPI, Request
-from citizenofthecloud_crewai import cloud_guard
+from citizenofthecloud_crewai import (
+    LookupAgentTool, GetServerIdentityTool,
+    ListDirectoryTool, GovernanceFeedTool,
+)
+
+LookupAgentTool().invoke({"cloud_id": "cc-abc..."})
+GetServerIdentityTool().invoke({"cloud_id": "cc-self...", "private_key": "..."})
+ListDirectoryTool().invoke({"limit": 10})
+GovernanceFeedTool().invoke({"limit": 10})
+```
+
+### Governance reporting (#16 ReportAgentTool)
+
+```python
+from citizenofthecloud_crewai import ReportAgentTool
+
+ReportAgentTool().invoke({
+    "sdk_token": "cotc_sdk_…",
+    "cloud_id": "cc-bad...",
+    "report_type": "spam",
+    "evidence": "Sent unsolicited bulk requests to /api/task every 100ms for 6 hours.",
+})
+```
+
+### Structural primitive #18 — FastAPI route guard
+
+For when your crew is served behind an HTTP API:
+
+```python
+from fastapi import FastAPI
+from citizenofthecloud import TrustPolicy
+from citizenofthecloud_crewai import CloudIdentityRouteGuard, cloud_guard_route
 
 app = FastAPI()
 
-@app.post("/api/research")
-async def research(request: Request):
-    # Verify the requesting agent before running the crew
-    guard = cloud_guard(
-        headers=dict(request.headers),
-        minimum_trust_score=0.5,
-        require_covenant=True,
-    )
+# App-wide
+app.add_middleware(
+    CloudIdentityRouteGuard,
+    policy=TrustPolicy(minimum_trust_score=0.5),
+)
 
-    if not guard["verified"]:
-        return {"error": "Identity verification failed", "reason": guard["reason"]}, 401
-
-    # Agent verified — run the crew with their info
-    result = crew.kickoff(inputs={
-        "query": (await request.json())["query"],
-        "requester": guard["agent"]["name"],
-        "requester_trust": guard["agent"]["trust_score"],
-    })
-
-    return {"status": "complete", "result": result.raw}
+# Or per-route
+@app.post("/crew/kickoff")
+@cloud_guard_route(policy=TrustPolicy(minimum_trust_score=0.5))
+async def kickoff(request: Request):
+    return crew.kickoff(inputs=await request.json())
 ```
 
-### 4. Use with @CrewBase and @before_kickoff
+In-process equivalent (use this when there's no HTTP layer — e.g. a queue-triggered kickoff):
 
 ```python
-from crewai import Agent, Task
-from crewai.project import CrewBase, agent, task, crew, before_kickoff
-from citizenofthecloud_crewai import cloud_guard, cloud_identity_tools
+from citizenofthecloud_crewai import cloud_guard
 
-@CrewBase
-class ResearchCrew:
-    """A research crew that verifies all incoming requests."""
-
-    @before_kickoff
-    def verify_requester(self, inputs):
-        """Verify the requesting agent before the crew starts."""
-        if "request_headers" in inputs:
-            guard = cloud_guard(
-                headers=inputs["request_headers"],
-                minimum_trust_score=0.5,
-            )
-            if not guard["verified"]:
-                raise PermissionError(
-                    f"Agent verification failed: {guard['reason']}"
-                )
-            inputs["verified_agent"] = guard["agent"]
-        return inputs
-
-    @agent
-    def researcher(self) -> Agent:
-        return Agent(
-            role="Researcher",
-            goal="Find accurate information",
-            backstory="A thorough researcher.",
-            tools=cloud_identity_tools(),
-        )
-
-    @task
-    def research_task(self) -> Task:
-        return Task(
-            description="Research {query} for verified agent {verified_agent[name]}",
-            expected_output="Research findings",
-            agent=self.researcher(),
-        )
-
-    @crew
-    def crew(self):
-        return Crew(
-            agents=self.agents,
-            tasks=self.tasks,
-            verbose=True,
-        )
+guard = cloud_guard(headers=incoming_headers, minimum_trust_score=0.5)
+if not guard["verified"]:
+    raise PermissionError(guard["reason"])
+crew.kickoff(inputs={"requester": guard["agent"]["name"]})
 ```
 
-### 5. Callbacks for Identity Event Logging
+### Structural primitive #19 — `CloudIdentityCrew`
+
+A drop-in `Crew` subclass that:
+- Auto-injects all 17 identity tools into every agent in the crew (unless they already have them)
+- Provides `sign_headers()` / `sign_request_headers()` methods for outbound signing
+- Hooks `identity_step_callback` into `step_callback` by default
+
+```python
+crew = CloudIdentityCrew.from_env(   # reads CLOUD_ID + CLOUD_PRIVATE_KEY
+    agents=[researcher, analyst],
+    tasks=[research_task, analysis_task],
+    minimum_trust_score=0.5,
+)
+result = crew.kickoff()
+
+# Sign an outbound request from anywhere in the crew lifecycle:
+headers = crew.sign_headers()
+```
+
+### Structural primitive #20 — observability callbacks
 
 ```python
 from crewai import Crew
 from citizenofthecloud_crewai import identity_step_callback, identity_task_callback
 
 crew = Crew(
-    agents=[researcher, analyst],
-    tasks=[research_task, analysis_task],
-    step_callback=identity_step_callback,    # Logs identity tool usage
-    task_callback=identity_task_callback,    # Logs verification in task results
-    verbose=True,
+    agents=[...], tasks=[...],
+    step_callback=identity_step_callback,   # logs every identity-tool invocation
+    task_callback=identity_task_callback,   # flags identity-relevant task completions
 )
 ```
 
-### 6. Sign Outbound Requests from a Crew
+Output is structured-log via `structlog` — pipe it into your existing log aggregator.
 
-```python
-import requests
-from citizenofthecloud_crewai import CloudIdentityCrew
+---
 
-crew = CloudIdentityCrew.from_env(
-    agents=[researcher, analyst],
-    tasks=[research_task, analysis_task],
-)
-
-# Sign requests when the crew needs to call external agents
-signed_headers = crew.sign_headers()
-response = requests.post(
-    "https://other-agent.com/api/data",
-    headers={**signed_headers, "Content-Type": "application/json"},
-    json={"query": "latest market data"},
-)
-```
-
-## Tools Reference
-
-### RegisterAgentTool
-
-One-shot agent registration. Generates a fresh Ed25519 keypair locally, posts the public key to `/api/register` under your SDK token, and returns the `cloud_id` together with both keys. The private key never leaves the caller's process. Use ONCE at agent setup time, not in regular operation.
-
-**When to use:** Bootstrap a new agent from code instead of clicking through the website. Requires a `cotc_sdk_*` token from [/account](https://citizenofthecloud.com/account).
-
-### VerifyAgentTool
-
-Full cryptographic verification of an agent's identity from request headers. Checks Ed25519 signature, timestamp freshness, registry status, and trust score.
-
-**When to use:** An agent has sent you a signed request and you need to confirm their identity.
-
-### LookupAgentTool
-
-Profile lookup from the Cloud Identity registry. Returns name, purpose, trust score, capabilities, and status. No cryptographic verification — informational only.
-
-**When to use:** You want to learn about an agent before deciding whether to delegate work.
-
-### CheckTrustTool
-
-Quick pass/fail trust check against a threshold. Returns whether the agent meets the minimum trust score.
-
-**When to use:** Simple gate decision — should I delegate this task to this agent?
-
-### cloud_identity_tools()
-
-Convenience function that returns all three tools in a list. Pass directly to an agent's `tools` parameter.
-
-## Environment Variables
+## Environment variables
 
 | Variable | Description |
 |---|---|
-| `CLOUD_ID` | Your crew's Cloud ID (e.g., `cc-7f3a9b2e-...`) |
-| `CLOUD_PRIVATE_KEY` | Your crew's Ed25519 private key (PEM format) |
-| `COTC_SDK_TOKEN` | Bootstrap SDK token (`cotc_sdk_*`) used by `RegisterAgentTool`. Obtain from [citizenofthecloud.com/account](https://citizenofthecloud.com/account). |
+| `CLOUD_ID` | Your agent's Cloud ID (e.g., `cc-7f3a9b2e-...`). Read by `CloudIdentityCrew.from_env()`. |
+| `CLOUD_PRIVATE_KEY` | Your agent's Ed25519 private key (PEM format). Read by `from_env()`. |
+| `COTC_SDK_TOKEN` | Bootstrap SDK token (`cotc_sdk_*`) used by `RegisterAgentTool` and `ReportAgentTool`. Get one at [citizenofthecloud.com/account](https://citizenofthecloud.com/account). |
+
+---
 
 ## Links
 
-- [Citizen of the Cloud](https://citizenofthecloud.com)
-- [SDK Documentation](https://citizenofthecloud.com/docs)
+- [citizenofthecloud.com](https://citizenofthecloud.com)
+- [Documentation](https://citizenofthecloud.com/docs)
 - [Specification](https://citizenofthecloud.com/spec)
-- [Python SDK](https://github.com/citizenofthecloud/sdk-python)
-- [LangChain Integration](https://github.com/citizenofthecloud/langchain)
-- [Register an Agent](https://citizenofthecloud.com/register)
+- [Account / SDK tokens](https://citizenofthecloud.com/account)
+- Sister framework integrations: [langchain](https://github.com/citizenofthecloud/langchain) · [agent-framework](https://github.com/citizenofthecloud/agent-framework)
+- Underlying SDK: [sdk-python](https://github.com/citizenofthecloud/sdk-python)
+- [MCP server](https://github.com/citizenofthecloud/mcp-server)
+
+## License
+
+MIT
