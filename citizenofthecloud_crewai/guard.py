@@ -8,7 +8,7 @@ and rejects unverified or untrusted requesters.
 """
 
 from typing import Optional, Dict, Any, Callable
-from citizenofthecloud import verify_agent
+from citizenofthecloud import verify_agent, TrustPolicy
 
 
 def cloud_guard(
@@ -74,19 +74,15 @@ def cloud_guard(
     Returns:
         Dict with 'verified' (bool), 'agent' (if verified), 'reason' (if rejected)
     """
-    policy = {}
-
-    if minimum_trust_score > 0:
-        policy["minimum_trust_score"] = minimum_trust_score
-    if require_covenant:
-        policy["require_covenant"] = require_covenant
-    if allowed_autonomy_levels:
-        policy["allowed_autonomy_levels"] = allowed_autonomy_levels
-    if blocked_agents:
-        policy["blocked_agents"] = blocked_agents
+    policy = TrustPolicy(
+        minimum_trust_score=minimum_trust_score if minimum_trust_score > 0 else None,
+        require_covenant=require_covenant,
+        allowed_autonomy_levels=allowed_autonomy_levels,
+        blocked_agents=blocked_agents,
+    )
 
     try:
-        result = verify_agent(headers, policy=policy if policy else None)
+        result = verify_agent(headers, policy=policy)
     except Exception as e:
         result = {"verified": False, "reason": f"verification_error: {str(e)}"}
 

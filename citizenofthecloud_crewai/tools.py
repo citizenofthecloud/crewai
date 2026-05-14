@@ -1,270 +1,363 @@
 """
 CrewAI tools for Citizen of the Cloud identity verification.
 
-These tools allow CrewAI agents to verify other agents' identities,
-look up agent profiles, and check trust scores before interacting.
-Uses crewai.tools.BaseTool for native CrewAI compatibility.
+Full 17 agent-callable tools. Structural primitives (CloudIdentityCrew,
+cloud_guard, step/task callbacks) live in their own modules.
 """
 
 from typing import Optional, Type, List
 from pydantic import BaseModel, Field
 from crewai.tools import BaseTool
 
-from citizenofthecloud import verify_agent
+from citizenofthecloud import (
+    verify_agent,
+    verify_request,
+    generate_key_pair,
+    cloud_fetch,
+    request_challenge,
+    submit_challenge_response,
+    lookup_agent,
+    list_directory,
+    get_governance_feed,
+    register_agent,
+    CloudIdentity,
+)
+
+DEFAULT_REGISTRY = "https://citizenofthecloud.com"
 
 
-# ═══════════════════════════════════════════════════════════
-# INPUT SCHEMAS
-# ═══════════════════════════════════════════════════════════
+def _fmt_agent(agent: dict) -> str:
+    caps = ", ".join(agent.get("capabilities") or []) or "None listed"
+    return (
+        f"Agent: {agent.get('name', 'Unknown')}\n"
+        f"Cloud ID: {agent.get('cloud_id', 'Unknown')}\n"
+        f"Purpose: {agent.get('declared_purpose', 'Not declared')}\n"
+        f"Autonomy: {agent.get('autonomy_level', 'Unknown')}\n"
+        f"Trust Score: {agent.get('trust_score', 'N/A')}\n"
+        f"Capabilities: {caps}\n"
+        f"Covenant Signed: {agent.get('covenant_signed', False)}\n"
+        f"Status: {agent.get('status', 'Unknown')}"
+    )
 
-class VerifyAgentInput(BaseModel):
-    """Input for verifying an agent's identity from request headers."""
-    cloud_id: str = Field(description="The Cloud ID from the X-Cloud-ID header")
-    timestamp: str = Field(description="The timestamp from the X-Cloud-Timestamp header")
-    signature: str = Field(description="The signature from the X-Cloud-Signature header")
 
-
+# 1. lookup-agent
 class LookupAgentInput(BaseModel):
-    """Input for looking up an agent's profile."""
     cloud_id: str = Field(description="The Cloud ID of the agent to look up")
 
 
-class CheckTrustInput(BaseModel):
-    """Input for checking if an agent meets a trust threshold."""
-    cloud_id: str = Field(description="The Cloud ID of the agent to check")
-    minimum_trust_score: float = Field(
-        default=0.5,
-        description="Minimum trust score required (0.0 to 1.0)"
+class LookupAgentTool(BaseTool):
+    name: str = "lookup_cloud_agent"
+    description: str = (
+        "Look up an AI agent's public profile in the Citizen of the Cloud registry."
     )
+    args_schema: Type[BaseModel] = LookupAgentInput
+    registry_url: str = DEFAULT_REGISTRY
+
+    def _run(self, cloud_id: str) -> str:
+        agent = lookup_agent(self.registry_url, cloud_id)
+        if not agent:
+            return f"Agent not found or inactive: {cloud_id}"
+        return _fmt_agent(agent)
 
 
-# ═══════════════════════════════════════════════════════════
-# VERIFY AGENT TOOL
-# ═══════════════════════════════════════════════════════════
+# 2. get-server-identity
+class GetServerIdentityInput(BaseModel):
+    cloud_id: str = Field(description="This agent's own Cloud ID")
+    private_key: str = Field(description="This agent's PEM-encoded private key")
+
+
+class GetServerIdentityTool(BaseTool):
+    name: str = "get_server_identity"
+    description: str = "Fetch this agent's own passport from the registry."
+    args_schema: Type[BaseModel] = GetServerIdentityInput
+    registry_url: str = DEFAULT_REGISTRY
+
+    def _run(self, cloud_id: str, private_key: str) -> str:
+        identity = CloudIdentity(cloud_id=cloud_id, private_key=private_key, registry_url=self.registry_url)
+        passport = identity.get_passport()
+        if not passport:
+            return f"No passport found for {cloud_id}"
+        return _fmt_agent(passport)
+
+
+# 3. list-directory
+class ListDirectoryInput(BaseModel):
+    limit: int = Field(default=20, description="Max entries to summarize")
+
+
+class ListDirectoryTool(BaseTool):
+    name: str = "list_cloud_directory"
+    description: str = "List public entries in the Citizen of the Cloud agent directory."
+    args_schema: Type[BaseModel] = ListDirectoryInput
+    registry_url: str = DEFAULT_REGISTRY
+
+    def _run(self, limit: int = 20) -> str:
+        agents = list_directory(self.registry_url)
+        if not agents:
+            return "Directory is empty."
+        lines = [f"{len(agents)} agent(s) in directory (showing up to {limit}):"]
+        for a in agents[:limit]:
+            lines.append(
+                f"  - {a.get('name','?')} ({a.get('cloud_id','?')}) "
+                f"trust={a.get('trust_score','?')} status={a.get('status','?')}"
+            )
+        return "\n".join(lines)
+
+
+# 4. governance-feed
+class GovernanceFeedInput(BaseModel):
+    limit: int = Field(default=20)
+
+
+class GovernanceFeedTool(BaseTool):
+    name: str = "governance_feed"
+    description: str = "Read the Citizen of the Cloud governance activity feed."
+    args_schema: Type[BaseModel] = GovernanceFeedInput
+    registry_url: str = DEFAULT_REGISTRY
+
+    def _run(self, limit: int = 20) -> str:
+        feed = get_governance_feed(self.registry_url)
+        if not feed:
+            return "Governance feed is empty."
+        lines = [f"{len(feed)} event(s) (showing up to {limit}):"]
+        for ev in feed[:limit]:
+            lines.append(
+                f"  - {ev.get('event_type', ev.get('type','?'))} "
+                f"at {ev.get('created_at', ev.get('timestamp','?'))}"
+            )
+        return "\n".join(lines)
+
+
+# 5. verify-agent
+class VerifyAgentInput(BaseModel):
+    cloud_id: str = Field(description="X-Cloud-ID header")
+    timestamp: str = Field(description="X-Cloud-Timestamp header")
+    signature: str = Field(description="X-Cloud-Signature header")
+
 
 class VerifyAgentTool(BaseTool):
-    """
-    Verify another agent's identity using the Cloud Identity protocol.
-
-    Use this when you receive a request from another agent and need to
-    confirm their identity. Checks cryptographic signature, validates
-    the timestamp, and returns the agent's full profile including
-    trust score and autonomy level.
-    """
-
     name: str = "verify_cloud_agent"
-    description: str = (
-        "Verify an AI agent's identity using the Citizen of the Cloud protocol. "
-        "Use this when you receive a request from another agent and need to confirm "
-        "they are who they claim to be. Requires the three X-Cloud-* header values. "
-        "Returns the agent's name, trust score, autonomy level, and verification status."
-    )
+    description: str = "Verify an AI agent's identity using the Citizen of the Cloud protocol."
     args_schema: Type[BaseModel] = VerifyAgentInput
+    registry_url: str = DEFAULT_REGISTRY
 
     def _run(self, cloud_id: str, timestamp: str, signature: str) -> str:
-        """Verify an agent's identity."""
+        headers = {"X-Cloud-ID": cloud_id, "X-Cloud-Timestamp": timestamp, "X-Cloud-Signature": signature}
+        result = verify_agent(headers, registry_url=self.registry_url)
+        if result.get("verified"):
+            return f"VERIFIED — {_fmt_agent(result['agent'])}"
+        return f"NOT VERIFIED — Reason: {result.get('reason')}"
+
+
+# 6. verify-request
+class VerifyRequestInput(BaseModel):
+    cloud_id: str = Field(description="X-Cloud-ID header")
+    timestamp: str = Field(description="X-Cloud-Timestamp header")
+    signature: str = Field(description="X-Cloud-Signature header")
+    url: str = Field(description="The exact request URL the signature is bound to")
+    method: str = Field(description="HTTP method")
+    body: str = Field(default="", description="Request body")
+
+
+class VerifyRequestTool(BaseTool):
+    name: str = "verify_cloud_request"
+    description: str = "Verify a request-bound Cloud Identity signature (covers URL, method, body)."
+    args_schema: Type[BaseModel] = VerifyRequestInput
+    registry_url: str = DEFAULT_REGISTRY
+
+    def _run(self, cloud_id: str, timestamp: str, signature: str, url: str, method: str, body: str = "") -> str:
+        from citizenofthecloud import TrustPolicy
         headers = {
             "X-Cloud-ID": cloud_id,
             "X-Cloud-Timestamp": timestamp,
             "X-Cloud-Signature": signature,
+            "X-Cloud-Request-Bound": "true",
         }
-
-        try:
-            result = verify_agent(headers)
-        except Exception as e:
-            return f"Verification error: {str(e)}"
-
-        if result["verified"]:
-            agent = result["agent"]
-            return (
-                f"VERIFIED — Agent: {agent['name']}, "
-                f"Cloud ID: {agent['cloud_id']}, "
-                f"Trust Score: {agent['trust_score']}, "
-                f"Autonomy: {agent['autonomy_level']}, "
-                f"Covenant Signed: {agent.get('covenant_signed', False)}, "
-                f"Status: {agent['status']}"
-            )
-        else:
-            return f"NOT VERIFIED — Reason: {result['reason']}"
+        policy = TrustPolicy(registry_url=self.registry_url)
+        result = verify_request(headers, url=url, method=method, body=body, policy=policy)
+        if result.get("verified"):
+            return f"VERIFIED (request-bound) — {_fmt_agent(result['agent'])}"
+        return f"NOT VERIFIED — Reason: {result.get('reason')}"
 
 
-# ═══════════════════════════════════════════════════════════
-# LOOKUP AGENT TOOL
-# ═══════════════════════════════════════════════════════════
+# 7. request-challenge
+class RequestChallengeInput(BaseModel):
+    cloud_id: str = Field(description="The Cloud ID requesting a challenge")
 
-class LookupAgentTool(BaseTool):
-    """
-    Look up an agent's profile from the Cloud Identity registry.
 
-    Use this to learn about an agent before deciding to interact with
-    them or delegate work to them. Returns their public profile
-    including trust score and capabilities. This is informational
-    only — not a cryptographic verification.
-    """
-
-    name: str = "lookup_cloud_agent"
-    description: str = (
-        "Look up an AI agent's public profile in the Citizen of the Cloud registry. "
-        "Use this to learn about an agent before deciding whether to interact with "
-        "or delegate work to them. Returns name, purpose, trust score, autonomy level, "
-        "capabilities, and status. This is a profile lookup, not cryptographic verification."
-    )
-    args_schema: Type[BaseModel] = LookupAgentInput
-    registry_url: str = "https://citizenofthecloud.com"
+class RequestChallengeTool(BaseTool):
+    name: str = "request_cloud_challenge"
+    description: str = "Request a verification challenge nonce for a Cloud ID."
+    args_schema: Type[BaseModel] = RequestChallengeInput
+    registry_url: str = DEFAULT_REGISTRY
 
     def _run(self, cloud_id: str) -> str:
-        """Look up an agent's profile."""
-        import requests
+        ch = request_challenge(self.registry_url, cloud_id)
+        return f"nonce={ch['nonce']} expires_in={ch.get('expires_in','?')}s"
 
-        try:
-            resp = requests.get(
-                f"{self.registry_url}/api/verify",
-                params={"cloud_id": cloud_id},
-                timeout=10,
-            )
-            data = resp.json()
-        except Exception as e:
-            return f"Lookup error: {str(e)}"
 
-        if not data.get("verified"):
-            return f"Agent not found or inactive: {cloud_id}"
+# 8. respond-to-challenge
+class RespondChallengeInput(BaseModel):
+    cloud_id: str = Field(description="The Cloud ID being verified")
+    nonce: str = Field(description="The hex nonce from request_cloud_challenge")
+    signature: str = Field(description="Base64 signature over the UTF-8 nonce bytes")
 
-        agent = data.get("agent", {})
-        capabilities = ", ".join(agent.get("capabilities", []))
 
+class RespondToChallengeTool(BaseTool):
+    name: str = "respond_to_cloud_challenge"
+    description: str = "Submit a signed challenge response."
+    args_schema: Type[BaseModel] = RespondChallengeInput
+    registry_url: str = DEFAULT_REGISTRY
+
+    def _run(self, cloud_id: str, nonce: str, signature: str) -> str:
+        result = submit_challenge_response(self.registry_url, cloud_id, nonce, signature)
+        if result.get("verified"):
+            return f"VERIFIED via challenge — {_fmt_agent(result['agent'])}"
+        return f"NOT VERIFIED — Reason: {result.get('error') or result.get('reason')}"
+
+
+# 9. sign-challenge
+class SignChallengeInput(BaseModel):
+    nonce: str = Field(description="The hex nonce from request_cloud_challenge")
+    private_key: str = Field(description="PEM-encoded Ed25519 private key")
+
+
+class SignChallengeTool(BaseTool):
+    name: str = "sign_cloud_challenge"
+    description: str = "Sign a challenge nonce locally with the agent's Ed25519 private key."
+    args_schema: Type[BaseModel] = SignChallengeInput
+
+    def _run(self, nonce: str, private_key: str) -> str:
+        import base64
+        from cryptography.hazmat.primitives import serialization
+        key = serialization.load_pem_private_key(private_key.encode("utf-8"), password=None)
+        sig = key.sign(nonce.encode("utf-8"))
+        return base64.b64encode(sig).decode("ascii")
+
+
+# 10. prove-identity
+class ProveIdentityInput(BaseModel):
+    cloud_id: str = Field(description="The agent's Cloud ID")
+    private_key: str = Field(description="PEM-encoded Ed25519 private key")
+
+
+class ProveIdentityTool(BaseTool):
+    name: str = "prove_cloud_identity"
+    description: str = "Prove this agent's identity via the full challenge/sign/respond loop."
+    args_schema: Type[BaseModel] = ProveIdentityInput
+    registry_url: str = DEFAULT_REGISTRY
+
+    def _run(self, cloud_id: str, private_key: str) -> str:
+        identity = CloudIdentity(cloud_id=cloud_id, private_key=private_key, registry_url=self.registry_url)
+        result = identity.prove_identity()
+        if result.get("verified"):
+            return f"VERIFIED — {_fmt_agent(result['agent'])}"
+        return f"NOT VERIFIED — Reason: {result.get('error') or result.get('reason')}"
+
+
+# 11. sign-headers
+class SignHeadersInput(BaseModel):
+    cloud_id: str = Field(description="The agent's Cloud ID")
+    private_key: str = Field(description="PEM-encoded Ed25519 private key")
+
+
+class SignHeadersTool(BaseTool):
+    name: str = "sign_cloud_headers"
+    description: str = "Produce signed X-Cloud-* headers for an outbound request."
+    args_schema: Type[BaseModel] = SignHeadersInput
+
+    def _run(self, cloud_id: str, private_key: str) -> str:
+        identity = CloudIdentity(cloud_id=cloud_id, private_key=private_key)
+        h = identity.sign()
         return (
-            f"Agent: {agent.get('name', 'Unknown')}\n"
-            f"Cloud ID: {agent.get('cloud_id', cloud_id)}\n"
-            f"Purpose: {agent.get('declared_purpose', 'Not declared')}\n"
-            f"Autonomy Level: {agent.get('autonomy_level', 'Unknown')}\n"
-            f"Trust Score: {agent.get('trust_score', 'N/A')}\n"
-            f"Capabilities: {capabilities or 'None listed'}\n"
-            f"Covenant Signed: {agent.get('covenant_signed', False)}\n"
-            f"Status: {agent.get('status', 'Unknown')}\n"
-            f"Registered: {agent.get('registered_at', 'Unknown')}"
+            f"X-Cloud-ID: {h['X-Cloud-ID']}\n"
+            f"X-Cloud-Timestamp: {h['X-Cloud-Timestamp']}\n"
+            f"X-Cloud-Signature: {h['X-Cloud-Signature']}"
         )
 
 
-# ═══════════════════════════════════════════════════════════
-# CHECK TRUST TOOL
-# ═══════════════════════════════════════════════════════════
-
-class CheckTrustTool(BaseTool):
-    """
-    Quick trust check — does an agent meet a minimum trust threshold?
-
-    Use this for a simple pass/fail decision before delegating work
-    to another agent or sharing sensitive data. Returns whether the
-    agent passes and their current score.
-    """
-
-    name: str = "check_agent_trust"
-    description: str = (
-        "Check if an AI agent meets a minimum trust score threshold. "
-        "Use this for a quick pass/fail decision before delegating tasks "
-        "or sharing data with another agent. Provide the Cloud ID and "
-        "the minimum trust score required (default 0.5). "
-        "Returns PASS or FAIL with the agent's current trust score."
-    )
-    args_schema: Type[BaseModel] = CheckTrustInput
-    registry_url: str = "https://citizenofthecloud.com"
-
-    def _run(self, cloud_id: str, minimum_trust_score: float = 0.5) -> str:
-        """Check trust score against threshold."""
-        import requests
-
-        try:
-            resp = requests.get(
-                f"{self.registry_url}/api/verify",
-                params={"cloud_id": cloud_id},
-                timeout=10,
-            )
-            data = resp.json()
-        except Exception as e:
-            return f"FAIL — Could not reach registry: {str(e)}"
-
-        if not data.get("verified"):
-            return f"FAIL — Agent not found or inactive: {cloud_id}"
-
-        agent = data.get("agent", {})
-        trust_score = agent.get("trust_score", 0)
-        name = agent.get("name", "Unknown")
-
-        if trust_score >= minimum_trust_score:
-            return (
-                f"PASS — {name} has trust score {trust_score} "
-                f"(threshold: {minimum_trust_score})"
-            )
-        else:
-            return (
-                f"FAIL — {name} has trust score {trust_score} "
-                f"(below threshold: {minimum_trust_score})"
-            )
+# 12. sign-request
+class SignRequestInput(BaseModel):
+    cloud_id: str = Field(description="The agent's Cloud ID")
+    private_key: str = Field(description="PEM-encoded Ed25519 private key")
+    url: str = Field(description="Target request URL")
+    method: str = Field(description="HTTP method")
+    body: str = Field(default="", description="Request body")
 
 
-# ═══════════════════════════════════════════════════════════
-# CONVENIENCE: GET ALL TOOLS
-# ═══════════════════════════════════════════════════════════
+class SignRequestTool(BaseTool):
+    name: str = "sign_cloud_request"
+    description: str = "Produce request-bound X-Cloud-* headers (covers URL, method, body hash)."
+    args_schema: Type[BaseModel] = SignRequestInput
 
-def cloud_identity_tools(
-    registry_url: str = "https://citizenofthecloud.com",
-) -> List[BaseTool]:
-    """
-    Create all three Cloud Identity tools in one call.
-
-    Usage:
-        from citizenofthecloud_crewai import cloud_identity_tools
-
-        agent = Agent(
-            role="Research Agent",
-            tools=cloud_identity_tools(),
+    def _run(self, cloud_id: str, private_key: str, url: str, method: str, body: str = "") -> str:
+        identity = CloudIdentity(cloud_id=cloud_id, private_key=private_key)
+        h = identity.sign_request(url, method, body)
+        return (
+            f"X-Cloud-ID: {h['X-Cloud-ID']}\n"
+            f"X-Cloud-Timestamp: {h['X-Cloud-Timestamp']}\n"
+            f"X-Cloud-Signature: {h['X-Cloud-Signature']}\n"
+            f"X-Cloud-Request-Bound: true"
         )
 
-    Args:
-        registry_url: Override the default registry URL
 
-    Returns:
-        List of [VerifyAgentTool, LookupAgentTool, CheckTrustTool]
-    """
-    return [
-        VerifyAgentTool(),
-        LookupAgentTool(registry_url=registry_url),
-        CheckTrustTool(registry_url=registry_url),
-    ]
+# 13. cloud-fetch
+class CloudFetchInput(BaseModel):
+    cloud_id: str = Field(description="The caller's Cloud ID")
+    private_key: str = Field(description="PEM-encoded Ed25519 private key")
+    url: str = Field(description="Target URL")
+    method: str = Field(default="GET", description="HTTP method")
+    body: Optional[str] = Field(default=None, description="Request body")
 
 
-# ═══════════════════════════════════════════════════════════
-# REGISTER AGENT TOOL
-# ═══════════════════════════════════════════════════════════
+class CloudFetchTool(BaseTool):
+    name: str = "cloud_fetch"
+    description: str = "Make an HTTP request with automatic Cloud Identity signing."
+    args_schema: Type[BaseModel] = CloudFetchInput
 
+    def _run(self, cloud_id: str, private_key: str, url: str, method: str = "GET", body: Optional[str] = None) -> str:
+        identity = CloudIdentity(cloud_id=cloud_id, private_key=private_key)
+        resp = cloud_fetch(identity, url, method=method, body=body)
+        body_str = resp.get("body")
+        if isinstance(body_str, (dict, list)):
+            import json
+            body_str = json.dumps(body_str)
+        return f"status={resp['status']}\nbody={body_str}"
+
+
+# 14. generate-keypair
+class GenerateKeypairInput(BaseModel):
+    pass
+
+
+class GenerateKeypairTool(BaseTool):
+    name: str = "generate_cloud_keypair"
+    description: str = "Generate a fresh Ed25519 keypair locally."
+    args_schema: Type[BaseModel] = GenerateKeypairInput
+
+    def _run(self) -> str:
+        keys = generate_key_pair()
+        return (
+            f"public_key:\n{keys['public_key']}\n"
+            f"private_key (STORE SECURELY):\n{keys['private_key']}"
+        )
+
+
+# 15. register-agent
 class RegisterAgentInput(BaseModel):
-    """Input for registering a new Cloud Identity agent."""
     sdk_token: str = Field(description="A cotc_sdk_* token from citizenofthecloud.com/account")
     name: str = Field(description="Human-readable name for the agent")
     declared_purpose: str = Field(description="What the agent does (<= 500 chars)")
-    autonomy_level: str = Field(default="tool", description="'tool' | 'assistant' | 'agent' | 'self-directing'")
-    capabilities: Optional[list] = Field(default=None, description="Optional list of capability strings")
-    operational_domain: Optional[str] = Field(default=None, description="Optional domain string")
+    autonomy_level: str = Field(default="tool")
+    capabilities: Optional[list] = Field(default=None)
+    operational_domain: Optional[str] = Field(default=None)
 
 
 class RegisterAgentTool(BaseTool):
-    """
-    Register a new Cloud Identity agent.
-
-    Generates a fresh Ed25519 keypair locally and posts the public key plus
-    metadata to the registry under the supplied SDK token. Returns cloud_id
-    + both keys. Private key never leaves this process — store it securely.
-    Use ONCE at agent setup; CloudIdentity uses the returned keys thereafter.
-    """
-
     name: str = "register_cloud_agent"
-    description: str = (
-        "Register a new agent with the Citizen of the Cloud registry. Generates "
-        "a keypair locally and posts the public key under your SDK token. Returns "
-        "cloud_id, public_key, private_key. Use ONCE at agent setup time."
-    )
+    description: str = "Register a new agent with the Citizen of the Cloud registry (SDK-token auth)."
     args_schema: Type[BaseModel] = RegisterAgentInput
-    registry_url: str = "https://citizenofthecloud.com"
+    registry_url: str = DEFAULT_REGISTRY
 
     def _run(
         self,
@@ -275,7 +368,7 @@ class RegisterAgentTool(BaseTool):
         capabilities: Optional[list] = None,
         operational_domain: Optional[str] = None,
     ) -> str:
-        from citizenofthecloud import register_agent, RegistryError, CloudSDKError
+        from citizenofthecloud import RegistryError, CloudSDKError
         try:
             result = register_agent(
                 sdk_token=sdk_token,
@@ -288,10 +381,95 @@ class RegisterAgentTool(BaseTool):
             )
         except (RegistryError, CloudSDKError) as e:
             return f"Registration error: {e}"
-
         return (
             f"Registered: {result['cloud_id']}\n"
             f"name: {result['name']}\n"
             f"public_key:\n{result['public_key']}\n"
             f"private_key (STORE SECURELY):\n{result['private_key']}"
         )
+
+
+# 16. report-agent
+class ReportAgentInput(BaseModel):
+    sdk_token: str = Field(description="cotc_sdk_* token with 'manage' scope, or a user JWT")
+    cloud_id: str = Field(description="Cloud ID of the agent being reported")
+    report_type: str = Field(description="impersonation | malicious_behavior | spam | covenant_violation | inaccurate_registration")
+    evidence: str = Field(description="Evidence text (20–2000 chars)")
+
+
+class ReportAgentTool(BaseTool):
+    name: str = "report_cloud_agent"
+    description: str = "File a governance report against another agent."
+    args_schema: Type[BaseModel] = ReportAgentInput
+    registry_url: str = DEFAULT_REGISTRY
+
+    def _run(self, sdk_token: str, cloud_id: str, report_type: str, evidence: str) -> str:
+        import json
+        import urllib.request
+        import urllib.error
+        body = json.dumps({"cloud_id": cloud_id, "report_type": report_type, "evidence": evidence}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.registry_url.rstrip('/')}/api/report",
+            data=body,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {sdk_token}"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return f"Report filed: id={data.get('report_id') or data.get('id') or 'ok'}"
+        except urllib.error.HTTPError as e:
+            try:
+                err = json.loads(e.read().decode("utf-8"))
+                return f"Report error ({e.code}): {err.get('error', str(e))}"
+            except Exception:
+                return f"Report error: HTTP {e.code}"
+        except urllib.error.URLError as e:
+            return f"Report error: registry unreachable: {e}"
+
+
+# 17. check-trust
+class CheckTrustInput(BaseModel):
+    cloud_id: str = Field(description="The Cloud ID of the agent to check")
+    minimum_trust_score: float = Field(default=0.5)
+
+
+class CheckTrustTool(BaseTool):
+    name: str = "check_agent_trust"
+    description: str = "Check if an AI agent meets a minimum trust score threshold."
+    args_schema: Type[BaseModel] = CheckTrustInput
+    registry_url: str = DEFAULT_REGISTRY
+
+    def _run(self, cloud_id: str, minimum_trust_score: float = 0.5) -> str:
+        agent = lookup_agent(self.registry_url, cloud_id)
+        if not agent:
+            return f"FAIL — Agent not found or inactive: {cloud_id}"
+        score = agent.get("trust_score", 0) or 0
+        name = agent.get("name", "Unknown")
+        if score >= minimum_trust_score:
+            return f"PASS — {name} trust={score} (threshold={minimum_trust_score})"
+        return f"FAIL — {name} trust={score} (below threshold={minimum_trust_score})"
+
+
+# Convenience — all 17 agent-callable tools
+def cloud_identity_tools(registry_url: str = DEFAULT_REGISTRY) -> List[BaseTool]:
+    """Return all 17 agent-callable CrewAI tools in one list."""
+    return [
+        LookupAgentTool(registry_url=registry_url),
+        GetServerIdentityTool(registry_url=registry_url),
+        ListDirectoryTool(registry_url=registry_url),
+        GovernanceFeedTool(registry_url=registry_url),
+        VerifyAgentTool(registry_url=registry_url),
+        VerifyRequestTool(registry_url=registry_url),
+        RequestChallengeTool(registry_url=registry_url),
+        RespondToChallengeTool(registry_url=registry_url),
+        SignChallengeTool(),
+        ProveIdentityTool(registry_url=registry_url),
+        SignHeadersTool(),
+        SignRequestTool(),
+        CloudFetchTool(),
+        GenerateKeypairTool(),
+        RegisterAgentTool(registry_url=registry_url),
+        ReportAgentTool(registry_url=registry_url),
+        CheckTrustTool(registry_url=registry_url),
+    ]
