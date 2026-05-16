@@ -51,7 +51,7 @@ class CloudIdentityCrew(Crew):
         minimum_trust_score: float = 0.0,
         inject_tools: bool = True,
         enable_step_logging: bool = True,
-        registry_url: str = "https://citizenofthecloud.com",
+        registry_url: str = "https://www.citizenofthecloud.com",
         **kwargs,
     ):
         """
